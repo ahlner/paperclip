@@ -3,7 +3,7 @@ import { connectionIntentDeliveryService } from "../services/connection-intent-d
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import * as localCredentials from "../services/local-ai-credentials.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, rm, access, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -12,7 +12,7 @@ import { createDb, companies, agents, heartbeatRuns, companyMemberships, connect
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { aiConnectionService } from "../services/ai-connections.js";
 import * as executionTarget from "@paperclipai/adapter-utils/execution-target";
-import { prepareManagedAiRuntime, assertManagedAiProjectAuth } from "../services/ai-connection-runtime.js";
+import { prepareManagedAiRuntime, assertManagedAiProjectAuth, resolveManagedGitlabMcpStorePath } from "../services/ai-connection-runtime.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { secretService } from "../services/secrets.js";
 import { aiConnectionBindingSchema, connectionPurposeTransportSchema, isAiConnectionCompatible } from "@paperclipai/shared";
@@ -460,6 +460,52 @@ describe("managed AI connections", () => {
     } finally {
       await Promise.all([parent.cleanup(), child.cleanup()]);
     }
+  });
+  it("carries one agent's GitLab MCP login into the next managed Codex run", async () => {
+    const userId = "gitlab-mcp-runtime-user";
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    const credential = JSON.stringify({ tokens: { access_token: "fixture-ai-access", refresh_token: "fixture-ai-refresh", id_token: "fixture-id", account_id: "fixture-account" } });
+    await service.save(companyId, userId, { provider: "openai", method: "subscription", ownership: "personal", name: "MCP runtime fixture", loginSessionId: "fixture", allAgents: true, agentIds: [] }, credential);
+    const runInput = { companyId, agentId, adapterType: "codex_local", responsibleUserId: userId, binding: { provider: "openai", method: "subscription", mode: "responsible_user" } as const, config: {} };
+    const first = await prepareManagedAiRuntime(db, runInput);
+    const entry = { server_name: "gitlab_ingress", server_url: "https://gitlab.com/api/v4/mcp", client_id: "fixture-client", access_token: "fixture-mcp-access", refresh_token: "fixture-mcp-refresh", scopes: ["mcp"] };
+    const mcpKey = `gitlab_ingress|${createHash("sha256").update(JSON.stringify({ headers: {}, type: "http", url: entry.server_url })).digest("hex").slice(0, 16)}`;
+    try {
+      const providerHome = String(first.config.env.CODEX_HOME);
+      expect(await readFile(path.join(providerHome, "config.toml"), "utf8")).toContain("[mcp_servers.gitlab_ingress]");
+      const stableHome = path.dirname(resolveManagedGitlabMcpStorePath(companyId, userId, agentId));
+      expect(await readFile(path.join(stableHome, "config.toml"), "utf8")).toContain("[mcp_servers.gitlab_ingress]");
+      await writeFile(path.join(providerHome, ".credentials.json"), JSON.stringify({ [mcpKey]: entry }), { mode: 0o600 });
+    } finally { await first.cleanup(); }
+    const second = await prepareManagedAiRuntime(db, runInput);
+    try {
+      const providerHome = String(second.config.env.CODEX_HOME);
+      expect(JSON.parse(await readFile(path.join(providerHome, ".credentials.json"), "utf8"))).toEqual({ [mcpKey]: entry });
+      expect(await readFile(path.join(providerHome, "auth.json"), "utf8")).toBe(credential);
+    } finally { await second.cleanup(); }
+    const otherUserId = "gitlab-mcp-other-user";
+    await db.insert(companyMemberships).values({ companyId, principalId: otherUserId, principalType: "user", status: "active", membershipRole: "member" });
+    await service.save(companyId, otherUserId, { provider: "openai", method: "subscription", ownership: "personal", name: "Other MCP runtime fixture", loginSessionId: "fixture", allAgents: true, agentIds: [] }, credential);
+    const other = await prepareManagedAiRuntime(db, { ...runInput, responsibleUserId: otherUserId });
+    try {
+      await expect(access(path.join(String(other.config.env.CODEX_HOME), ".credentials.json"))).rejects.toThrow();
+    } finally { await other.cleanup(); }
+  });
+  it("reports an invalid MCP copy-back without exposing credential bytes", async () => {
+    const userId = "gitlab-mcp-invalid-user";
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    const credential = JSON.stringify({ tokens: { access_token: "fixture-ai-access", refresh_token: "fixture-ai-refresh", id_token: "fixture-id", account_id: "fixture-account" } });
+    await service.save(companyId, userId, { provider: "openai", method: "subscription", ownership: "personal", name: "Invalid MCP runtime fixture", loginSessionId: "fixture", allAgents: true, agentIds: [] }, credential);
+    const run = await prepareManagedAiRuntime(db, { companyId, agentId, adapterType: "codex_local", responsibleUserId: userId, binding: { provider: "openai", method: "subscription", mode: "responsible_user" }, config: {} });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await writeFile(path.join(String(run.config.env.CODEX_HOME), ".credentials.json"), '{"access_token":"fixture-mcp-should-stay-secret"');
+      await run.cleanup();
+      const output = warning.mock.calls.flat().join(" ");
+      expect(output).toContain("invalid");
+      expect(output).not.toContain("fixture-mcp-should-stay-secret");
+      await expect(access(resolveManagedGitlabMcpStorePath(companyId, userId, agentId))).rejects.toThrow();
+    } finally { warning.mockRestore(); }
   });
   it("persists the freshest refreshed credential to its original grant across a same-account reconnect", async () => {
     const auth = (marker: string, hour: number) => JSON.stringify({ tokens: { account_id: "fixture-account", id_token: `id-${marker}`, access_token: `access-${marker}`, refresh_token: `refresh-${marker}` }, last_refresh: `2026-09-10T${hour}:00:00Z` });

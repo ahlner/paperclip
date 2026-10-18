@@ -20,6 +20,9 @@ const MANAGED_MCP_BLOCK_END = "# END PAPERCLIP MANAGED MCP";
  * stock upstream `codex` binary writes at runtime (`*.sqlite`, `*-wal`,
  * `plugins/`, `cache/`, `sessions/`, `shell_snapshots/`, …) is intentionally
  * excluded — it is large host-local runtime state the sandbox run never needs.
+ * MCP OAuth `.credentials.json` is intentionally staged separately in
+ * `execute.ts`, where the approved server entry is selected and versioned.
+ * Adding the aggregate file here would expose credentials for other servers.
  */
 export const CODEX_SYNC_ALLOWLIST = [
   ...COPIED_SHARED_FILES,

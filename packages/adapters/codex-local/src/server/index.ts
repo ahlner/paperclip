@@ -1,4 +1,5 @@
 export { execute, ensureCodexSkillsInjected } from "./execute.js";
+export { stageCodexMcpOauthStore, persistCodexMcpOauthStore, type CodexMcpOauthBaseline } from "./codex-mcp-oauth-store.js";
 export {
   resolveCodexAuthPrecedence,
   CODEX_SANDBOX_AUTH_PRECEDENCE_WARNING,

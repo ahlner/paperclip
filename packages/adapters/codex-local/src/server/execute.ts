@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { buildCodexAuthInboundProvision } from "./codex-auth-merge-scripts.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
+import { persistCodexMcpOauthStore, stageCodexMcpOauthStore } from "./codex-mcp-oauth-store.js";
 import {
   ensureCodexAuthCacheEntryDir,
   isCodexAuthCacheEnabled,
@@ -93,6 +94,7 @@ import { prepareCodexRuntimeConfig } from "./runtime-config.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
+
 import {
   CODEX_OUTPUT_INACTIVITY_MONITOR_SIGTERM_GRACE_MS,
   createCodexOutputInactivityMonitor,
@@ -113,6 +115,27 @@ const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeCodexAcp = createCodexAcpExecutor();
 const CODEX_ROLLOUT_NOISE_RE =
   /^\d{4}-\d{2}-\d{2}T[^\s]+\s+ERROR\s+codex_core::rollout::list:\s+state db missing rollout path for thread\s+[a-z0-9-]+$/i;
+
+async function hasManagedGitlabMcpOauthConfig(codexHome: string): Promise<boolean> {
+  const config = await fs.readFile(path.join(codexHome, "config.toml"), "utf8").catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  if (!config || !/^mcp_oauth_credentials_store\s*=\s*"file"\s*$/m.test(config)) return false;
+  const section: string[] = [];
+  let inGitlabSection = false;
+  for (const line of config.split(/\r?\n/)) {
+    if (/^\s*\[/.test(line)) {
+      inGitlabSection = /^\s*\[mcp_servers\.gitlab_ingress\]\s*$/.test(line);
+    } else if (inGitlabSection) {
+      section.push(line);
+    }
+  }
+  const fields = section.join("\n");
+  return /^url\s*=\s*"https:\/\/gitlab\.com\/api\/v4\/mcp"\s*$/m.test(fields)
+    && /^auth\s*=\s*"oauth"\s*$/m.test(fields)
+    && /^scopes\s*=\s*\["mcp"\]\s*$/m.test(fields);
+}
 
 function stripCodexRolloutNoise(text: string): string {
   const parts = text.split(/\r?\n/);
@@ -812,6 +835,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // large runtime state (`sessions/`, `*.sqlite`, `plugins/`, …) that the
           // 4-name denylist missed and that a sandbox run never needs.
           stagedCodexHomeDir = await stageCodexHomeForSync(effectiveCodexHome, { runId });
+          // Codex's MCP OAuth file is separate from auth.json. Carry only the
+          // approved GitLab endpoint into the sandbox, recording the staged
+          // version so a parallel run cannot overwrite a changed host token.
+          const mcpServerName = "gitlab_ingress";
+          const mcpServerUrl = "https://gitlab.com/api/v4/mcp";
+          const managedGitlabMcp = Boolean(config.managedAiConnection) && await hasManagedGitlabMcpOauthConfig(effectiveCodexHome);
+          const mcpBaseline = managedGitlabMcp ? await stageCodexMcpOauthStore({
+            stablePath: path.join(effectiveCodexHome, ".credentials.json"),
+            runHome: stagedCodexHomeDir,
+            serverName: mcpServerName,
+            serverUrl: mcpServerUrl,
+          }) : null;
           return await prepareAdapterExecutionTargetRuntime({
             runId,
             target: executionTarget,
@@ -847,23 +882,61 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 // generic `restore` seam per asset before destroying the sandbox.
                 // Target is the shared symlink SOURCE (what managed homes point
                 // `auth.json` at), not the in-sandbox symlink.
-                restore: async ({ assetDir, readFile }) =>
-                  void (await copyBackCodexAuth({
-                    readSandboxAuth: () => readFile(path.posix.join(assetDir, "auth.json")),
-                    hostAuthPath: path.join(config.managedAiConnection ? effectiveCodexHome : resolveSharedCodexHomeDir(process.env), "auth.json"),
-                    log: (line) => onLog("stdout", `${line}\n`),
-                    // Additive cache write (sandbox to host): also cache the
-                    // sandbox subscription credential in its per-identity slot,
-                    // keyed by the real `account_id`. Company-scoped root; the
-                    // helper ensures the slot directory private and containment-
-                    // guarded. The off-switch (default on) is read inside.
-                    resolveCacheEntryPath: config.managedAiConnection ? undefined : (accountId) =>
-                      ensureCodexAuthCacheEntryDir(process.env, accountId, agent.companyId),
-                    env: process.env,
-                  })),
+                restore: async ({ assetDir, readFile }) => {
+                  let authCopyBackError: unknown;
+                  try {
+                    await copyBackCodexAuth({
+                      readSandboxAuth: () => readFile(path.posix.join(assetDir, "auth.json")),
+                      hostAuthPath: path.join(config.managedAiConnection ? effectiveCodexHome : resolveSharedCodexHomeDir(process.env), "auth.json"),
+                      log: (line) => onLog("stdout", `${line}\n`),
+                      // Additive cache write (sandbox to host): also cache the
+                      // sandbox subscription credential in its per-identity slot,
+                      // keyed by the real `account_id`. Company-scoped root; the
+                      // helper ensures the slot directory private and containment-
+                      // guarded. The off-switch (default on) is read inside.
+                      resolveCacheEntryPath: config.managedAiConnection ? undefined : (accountId) =>
+                        ensureCodexAuthCacheEntryDir(process.env, accountId, agent.companyId),
+                      env: process.env,
+                    });
+                  } catch (error) {
+                    authCopyBackError = error;
+                  }
+                  let mcpCopyBackError: unknown;
+                  try {
+                    if (managedGitlabMcp) {
+                      let sandboxMcpBytes: Buffer | null = null;
+                      try {
+                        sandboxMcpBytes = await readFile(path.posix.join(assetDir, ".credentials.json"));
+                      } catch (error) {
+                        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+                      }
+                      if (sandboxMcpBytes) {
+                        // A complete sandbox read precedes the local write; the
+                        // guarded merge validates the payload before touching the
+                        // provider home. The stage directory is private and removed
+                        // at teardown even when validation fails.
+                        await fs.writeFile(path.join(stagedCodexHomeDir!, ".credentials.json"), sandboxMcpBytes, { mode: 0o600 });
+                        const outcome = await persistCodexMcpOauthStore({
+                          stablePath: path.join(effectiveCodexHome, ".credentials.json"),
+                          runHome: stagedCodexHomeDir!,
+                          serverName: mcpServerName,
+                          serverUrl: mcpServerUrl,
+                          baseline: mcpBaseline,
+                        });
+                        if (outcome === "conflict" || outcome === "invalid") {
+                          await onLog("stderr", `[paperclip] Codex MCP OAuth copy-back: ${outcome}; host credential kept.\n`);
+                        }
+                      }
+                    }
+                  } catch (error) {
+                    mcpCopyBackError = error;
+                  }
+                  if (mcpCopyBackError) throw mcpCopyBackError;
+                  if (authCopyBackError) throw authCopyBackError;
+                },
                 // No `exclude` denylist: `stagedCodexHomeDir` already contains
-                // ONLY the allowlisted files (auth/config/skills), so there is
-                // nothing to filter out.
+                // ONLY the allowlisted files (auth/config/skills) plus the
+                // selected GitLab MCP OAuth credential; nothing to filter out.
               },
             ],
           });

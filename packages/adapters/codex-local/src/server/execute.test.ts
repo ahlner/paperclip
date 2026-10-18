@@ -1,6 +1,7 @@
 import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { SandboxManagedRuntimeAsset } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
@@ -10,6 +11,8 @@ import type { SandboxManagedRuntimeAsset } from "@paperclipai/adapter-utils/sand
 // harness drives every round-trip case through the REAL `execute()` wiring.
 const captured: { assets: SandboxManagedRuntimeAsset[] } = { assets: [] };
 const sandboxAuthFixture: { bytes: Buffer } = { bytes: Buffer.from("{}") };
+const sandboxAuthReadError: { enabled: boolean } = { enabled: false };
+const sandboxMcpFixture: { bytes: Buffer | null } = { bytes: null };
 const REMOTE_RUNTIME_ROOT = "/remote/workspace/.paperclip-runtime/codex";
 
 const {
@@ -76,7 +79,14 @@ prepareAdapterExecutionTargetRuntime.mockImplementation(async (input: { assets?:
         if (!asset.restore) continue;
         await asset.restore({
           assetDir: `${REMOTE_RUNTIME_ROOT}/home`,
-          readFile: async () => sandboxAuthFixture.bytes,
+          readFile: async (file) => {
+            if (file.endsWith("/.credentials.json")) {
+              if (sandboxMcpFixture.bytes) return sandboxMcpFixture.bytes;
+              throw Object.assign(new Error("missing"), { code: "ENOENT" });
+            }
+            if (sandboxAuthReadError.enabled) throw Object.assign(new Error("auth read denied"), { code: "EACCES" });
+            return sandboxAuthFixture.bytes;
+          },
         });
       }
     },
@@ -117,7 +127,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     );
   }
 
-  async function runTeardown(input: { sandboxAuth: string; hostAuth: string; onProviderStopped?: () => Promise<void> }) {
+  async function runTeardown(input: { sandboxAuth: string; hostAuth: string; hostMcp?: string; sandboxMcp?: string; managedGitlab?: boolean; includeGitlabConfig?: boolean; authReadError?: boolean; allowExecutionError?: boolean; onProviderStopped?: () => Promise<void> }) {
     const rootDir = await mkdtemp(
       path.join(os.tmpdir(), "paperclip-codex-copyback-e2e-"),
     );
@@ -131,12 +141,24 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     await mkdir(sharedHostHome, { recursive: true });
     const hostAuthPath = path.join(sharedHostHome, "auth.json");
     await writeFile(hostAuthPath, input.hostAuth, { mode: 0o600 });
+    if (input.hostMcp) await writeFile(path.join(sharedHostHome, ".credentials.json"), input.hostMcp, { mode: 0o600 });
+    if (input.hostMcp && input.includeGitlabConfig !== false) await writeFile(path.join(sharedHostHome, "config.toml"), [
+      'cli_auth_credentials_store = "file"',
+      'mcp_oauth_credentials_store = "file"',
+      '[mcp_servers.gitlab_ingress]',
+      'url = "https://gitlab.com/api/v4/mcp"',
+      'auth = "oauth"',
+      'scopes = ["mcp"]',
+    ].join("\n"), { mode: 0o600 });
 
     savedCodexHomeEnv = process.env.CODEX_HOME;
     process.env.CODEX_HOME = sharedHostHome;
     sandboxAuthFixture.bytes = Buffer.from(input.sandboxAuth, "utf8");
+    sandboxAuthReadError.enabled = input.authReadError ?? false;
+    sandboxMcpFixture.bytes = input.sandboxMcp ? Buffer.from(input.sandboxMcp, "utf8") : null;
+    const logs: string[] = [];
 
-    const executionResult = await execute({
+    const invocation = execute({
       runId: "run-copyback-e2e",
       onProviderStopped: input.onProviderStopped,
       agent: {
@@ -153,6 +175,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
         // External CODEX_HOME (outside the managed company tree) so no managed
         // seeding rewrites auth.json before teardown; equals the shared host home.
         env: { CODEX_HOME: sharedHostHome },
+        ...(input.hostMcp && input.managedGitlab !== false ? { managedAiConnection: { provider: "openai", method: "subscription", identity: "fixture" } } : {}),
       },
       context: {
         paperclipWorkspace: {
@@ -172,12 +195,16 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
           strictHostKeyChecking: true,
         },
       },
-      onLog: async () => {},
+      onLog: async (_stream, line) => { logs.push(line); },
     });
+    const executionResult = input.allowExecutionError ? await invocation.catch(() => null) : await invocation;
 
     return {
       finalHostAuth: await readFile(hostAuthPath, "utf8"),
       finalHostMode: (await lstat(hostAuthPath)).mode & 0o777,
+      finalHostMcp: input.hostMcp ? await readFile(path.join(sharedHostHome, ".credentials.json"), "utf8") : null,
+      mcpLockCreated: await lstat(path.join(sharedHostHome, "mcp-oauth-locks")).then(() => true).catch(() => false),
+      logs: logs.join(""),
       executionResult,
     };
   }
@@ -227,6 +254,55 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     expect(homeAsset).toBeDefined();
     expect(homeAsset?.provision).toBeTruthy();
     expect(typeof homeAsset?.restore).toBe("function");
+  });
+
+  it("round-trips only a valid GitLab MCP OAuth refresh from the remote home", async () => {
+    const mcpKey = `gitlab_ingress|${createHash("sha256").update(JSON.stringify({ headers: {}, type: "http", url: "https://gitlab.com/api/v4/mcp" })).digest("hex").slice(0, 16)}`;
+    const mcp = (token: string) => JSON.stringify({ [mcpKey]: {
+      server_name: "gitlab_ingress", server_url: "https://gitlab.com/api/v4/mcp",
+      client_id: "client", access_token: token, refresh_token: `refresh-${token}`,
+      scopes: ["mcp"],
+    } });
+    const result = await runTeardown({ sandboxAuth: "{}", hostAuth: "{}", hostMcp: mcp("before"), sandboxMcp: mcp("after") });
+    expect(JSON.parse(result.finalHostMcp!)[mcpKey].access_token).toBe("after");
+  });
+
+  it("leaves an unrelated remote Codex home untouched without a managed GitLab connection", async () => {
+    const mcpKey = `gitlab_ingress|${createHash("sha256").update(JSON.stringify({ headers: {}, type: "http", url: "https://gitlab.com/api/v4/mcp" })).digest("hex").slice(0, 16)}`;
+    const mcp = (token: string) => JSON.stringify({ [mcpKey]: { server_name: "gitlab_ingress", server_url: "https://gitlab.com/api/v4/mcp", client_id: "client", access_token: token, scopes: ["mcp"] } });
+    const result = await runTeardown({ sandboxAuth: "{}", hostAuth: "{}", hostMcp: mcp("before"), sandboxMcp: mcp("after"), managedGitlab: false });
+    expect(JSON.parse(result.finalHostMcp!)[mcpKey].access_token).toBe("before");
+    expect(result.mcpLockCreated).toBe(false);
+  });
+
+  it("does not stage MCP OAuth when the managed GitLab config is absent", async () => {
+    const mcpKey = `gitlab_ingress|${createHash("sha256").update(JSON.stringify({ headers: {}, type: "http", url: "https://gitlab.com/api/v4/mcp" })).digest("hex").slice(0, 16)}`;
+    const mcp = (token: string) => JSON.stringify({ [mcpKey]: { server_name: "gitlab_ingress", server_url: "https://gitlab.com/api/v4/mcp", client_id: "client", access_token: token, scopes: ["mcp"] } });
+    const result = await runTeardown({ sandboxAuth: "{}", hostAuth: "{}", hostMcp: mcp("before"), sandboxMcp: mcp("after"), includeGitlabConfig: false });
+    expect(JSON.parse(result.finalHostMcp!)[mcpKey].access_token).toBe("before");
+    expect(result.mcpLockCreated).toBe(false);
+  });
+
+  it("keeps the host MCP credential and logs no tokens when remote payload is incomplete", async () => {
+    const mcpKey = `gitlab_ingress|${createHash("sha256").update(JSON.stringify({ headers: {}, type: "http", url: "https://gitlab.com/api/v4/mcp" })).digest("hex").slice(0, 16)}`;
+    const mcp = (token: string) => JSON.stringify({ [mcpKey]: {
+      server_name: "gitlab_ingress", server_url: "https://gitlab.com/api/v4/mcp",
+      client_id: "client", access_token: token, refresh_token: `refresh-${token}`, scopes: ["mcp"],
+    } });
+    const result = await runTeardown({ sandboxAuth: "{}", hostAuth: "{}", hostMcp: mcp("host-secret"), sandboxMcp: JSON.stringify({ [mcpKey]: { server_name: "gitlab_ingress", server_url: "https://gitlab.com/api/v4/mcp", access_token: "partial-secret" } }) });
+    expect(JSON.parse(result.finalHostMcp!)[mcpKey].access_token).toBe("host-secret");
+    expect(result.logs).not.toContain("host-secret");
+    expect(result.logs).not.toContain("partial-secret");
+  });
+
+  it("copies back MCP OAuth even when independent auth.json copy-back fails", async () => {
+    const mcpKey = `gitlab_ingress|${createHash("sha256").update(JSON.stringify({ headers: {}, type: "http", url: "https://gitlab.com/api/v4/mcp" })).digest("hex").slice(0, 16)}`;
+    const mcp = (token: string) => JSON.stringify({ [mcpKey]: {
+      server_name: "gitlab_ingress", server_url: "https://gitlab.com/api/v4/mcp",
+      client_id: "client", access_token: token, refresh_token: `refresh-${token}`, scopes: ["mcp"],
+    } });
+    const result = await runTeardown({ sandboxAuth: "{}", hostAuth: "{}", hostMcp: mcp("before"), sandboxMcp: mcp("after"), authReadError: true, allowExecutionError: true });
+    expect(JSON.parse(result.finalHostMcp!)[mcpKey].access_token).toBe("after");
   });
 
   it("round-trips a strictly-newer same-identity sandbox auth.json to the shared host at 0600 on teardown", async () => {
@@ -311,6 +387,6 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
       sandboxAuth: subscriptionAuth({ accountId: "acct", marker: "sandbox" }),
       hostAuth: subscriptionAuth({ accountId: "acct", marker: "host" }),
     });
-    expect(result.executionResult.errorMessage).toBe("provider failed first");
+    expect(result.executionResult?.errorMessage).toBe("provider failed first");
   });
 });

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { HttpError, unprocessable } from "../errors.js";
-import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm, chmod, lstat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { and, eq } from "drizzle-orm";
@@ -11,14 +11,52 @@ import {
 } from "@paperclipai/shared";
 import { aiConnectionService } from "./ai-connections.js";
 import { secretService } from "./secrets.js";
-import { decideCodexAuthMerge } from "@paperclipai/adapter-codex-local/server";
+import { decideCodexAuthMerge, stageCodexMcpOauthStore, persistCodexMcpOauthStore } from "@paperclipai/adapter-codex-local/server";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";
+import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 
 export function isAiConnectionBusy(error: unknown): error is HttpError {
   return error instanceof HttpError && error.status === 422 &&
     (error.details as { code?: unknown } | undefined)?.code === "ai_connection_busy";
+}
+
+const GITLAB_MCP_TOOLS = [
+  "get_mcp_server_version",
+  "get_user",
+  "get_project",
+  "list_work_items",
+  "get_work_item",
+  "list_merge_requests",
+  "get_merge_request",
+] as const;
+
+/** The managed Codex home cannot load project-local .codex/config.toml. */
+export function managedCodexProviderConfig(): string {
+  return [
+    'cli_auth_credentials_store = "file"',
+    'mcp_oauth_credentials_store = "file"',
+    "[features]",
+    "rmcp_client = true",
+    "[mcp_servers.gitlab_ingress]",
+    'url = "https://gitlab.com/api/v4/mcp"',
+    'auth = "oauth"',
+    'scopes = ["mcp"]',
+    "enabled = true",
+    `enabled_tools = [${GITLAB_MCP_TOOLS.map((tool) => JSON.stringify(tool)).join(", ")}]`,
+    `http_headers = { X-Gitlab-Enabled-Mcp-Server-Tools = "${GITLAB_MCP_TOOLS.join(",")}" }`,
+    'default_tools_approval_mode = "prompt"',
+    "",
+  ].join("\n");
+}
+
+/** Stable, opaque path for one agent's GitLab MCP login under the instance secret tree. */
+export function resolveManagedGitlabMcpStorePath(companyId: string, responsibleUserId: string | null, agentId: string): string {
+  const key = createHash("sha256")
+    .update(JSON.stringify([companyId, responsibleUserId, agentId, "gitlab_ingress", "https://gitlab.com/api/v4/mcp"]))
+    .digest("hex");
+  return path.join(resolvePaperclipInstanceRoot(), "secrets", "mcp-oauth", key, "gitlab_ingress", ".credentials.json");
 }
 
 // Blank values intentionally override inherited credentials in CLI child environments.
@@ -283,12 +321,35 @@ export async function prepareManagedAiRuntime(
         selection.attribution.method
       ]!;
     const authFile = path.join(providerHome, "auth.json");
+    const managedCodexMcp = input.binding.provider === "openai" && input.adapterType === "codex_local";
+    const mcpStoreInput = managedCodexMcp ? {
+      stablePath: resolveManagedGitlabMcpStorePath(input.companyId, input.responsibleUserId, input.agentId),
+      runHome: providerHome,
+      serverName: "gitlab_ingress",
+      serverUrl: "https://gitlab.com/api/v4/mcp",
+    } : null;
+    let mcpBaseline: Awaited<ReturnType<typeof stageCodexMcpOauthStore>> = null;
     if (input.binding.provider === "openai")
       await writeFile(
         path.join(providerHome, "config.toml"),
-        'cli_auth_credentials_store = "file"\n',
+        input.adapterType === "codex_local" ? managedCodexProviderConfig() : 'cli_auth_credentials_store = "file"\n',
         { mode: 0o600 },
       );
+    if (mcpStoreInput) {
+      const stableHome = path.dirname(mcpStoreInput.stablePath);
+      await mkdir(stableHome, { recursive: true, mode: 0o700 });
+      if ((await lstat(stableHome)).isSymbolicLink()) throw new Error("Managed Codex MCP home cannot be a symlink");
+      await chmod(stableHome, 0o700);
+      const stableConfig = path.join(stableHome, "config.toml");
+      const existingConfig = await lstat(stableConfig).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+      });
+      if (existingConfig && !existingConfig.isFile()) throw new Error("Managed Codex MCP config must be a regular file");
+      await writeFile(stableConfig, managedCodexProviderConfig(), { mode: 0o600 });
+      await chmod(stableConfig, 0o600);
+      mcpBaseline = await stageCodexMcpOauthStore(mcpStoreInput);
+    }
     if (subscriptionFile) await writeFile(authFile, value, { mode: 0o600 });
     else env[capability.envKey] = value;
     if (
@@ -392,7 +453,15 @@ export async function prepareManagedAiRuntime(
               });
           }
         } finally {
-          if (home) await rm(home, { recursive: true, force: true });
+          try {
+            if (mcpStoreInput) {
+              const outcome = await persistCodexMcpOauthStore({ ...mcpStoreInput, baseline: mcpBaseline });
+              if (outcome === "invalid" || outcome === "conflict")
+                console.warn(`[paperclip] Managed Codex MCP OAuth copy-back: ${outcome}; stable credential kept.`);
+            }
+          } finally {
+            if (home) await rm(home, { recursive: true, force: true });
+          }
         }
       },
     };
