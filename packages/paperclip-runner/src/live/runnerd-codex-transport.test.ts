@@ -1762,6 +1762,39 @@ it("uses file-backed AWS workload identity without forwarding access keys or Pap
 });
 
 it.each([
+  ["true", "disabled", "true", "disabled"],
+  ["false", undefined, "false", undefined],
+  ["invalid", "enabled", undefined, undefined],
+] as const)("projects Codex ACP network policy through runnerd and sidecar (%s, %s)", (override, runnerAccess, expectedOverride, expectedRunnerAccess) => {
+  const environment = createCapabilityRunnerdProviderEnvironment({
+    provider: "acpx",
+    options: {
+      provider: "acpx", acpxAgent: "codex",
+      environment: {
+        PAPERCLIP_CODEX_ACP_NETWORK_ACCESS: override,
+        PAPERCLIP_RUNNER_NETWORK_ACCESS: runnerAccess,
+        PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: "secret",
+      },
+    },
+    identity: {
+      runnerInstanceId: "runner-1", environmentLeaseId: "lease-1",
+      runId: "run-1", normalizedSessionId: "session-1",
+      turnId: "turn-1", itemId: "item-1",
+    },
+    codexHome: "/isolated/codex-home",
+    runtimeContextPath: "/isolated/runtime-context.json",
+    hasRuntimeContext: true,
+    acpxSidecarPath: "/verified/provider-pack/dist/cli/acpx-runtime-sidecar.cjs",
+  });
+  const sidecar = createAcpxSidecarHostEnvironment(environment, "codex", "session-1");
+  for (const child of [environment, sidecar]) {
+    expect(child.PAPERCLIP_CODEX_ACP_NETWORK_ACCESS).toBe(expectedOverride);
+    expect(child.PAPERCLIP_RUNNER_NETWORK_ACCESS).toBe(expectedRunnerAccess);
+    expect(child.PAPERCLIP_RUNNER_BOOTSTRAP_TICKET).toBeUndefined();
+  }
+});
+
+it.each([
   { agent: "cursor" as const, allowed: ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"],
     denied: ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"] },
   { agent: "copilot" as const, allowed: ["COPILOT_GITHUB_TOKEN"],

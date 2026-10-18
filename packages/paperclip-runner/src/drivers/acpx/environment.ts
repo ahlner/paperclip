@@ -111,6 +111,7 @@ export function createSanitizedAcpxSpawnInput(
     "PAPERCLIP_NATIVE_MCP_NAME",
     "PAPERCLIP_NATIVE_MCP_URL",
     ...credentialNames,
+    ...(agent === "codex" ? ["PAPERCLIP_CODEX_ACP_NETWORK_ACCESS", "PAPERCLIP_RUNNER_NETWORK_ACCESS"] : []),
   ]);
   let retainedBytes = 0;
   for (const [key, value] of Object.entries(source)) {
@@ -119,6 +120,10 @@ export function createSanitizedAcpxSpawnInput(
     // transport settings may come from the host; login state never does.
     if (candidate && environment === undefined && credentialNames.includes(key)) continue;
     if (!allowed.has(key) && !/^LC_[A-Z0-9_]{1,32}$/.test(key)) continue;
+    // These runner-projected policy inputs have only exact, defined values.
+    // Neither child boundary forwards an arbitrary caller override.
+    if (key === "PAPERCLIP_CODEX_ACP_NETWORK_ACCESS" && value !== "true" && value !== "false") continue;
+    if (key === "PAPERCLIP_RUNNER_NETWORK_ACCESS" && value !== "disabled") continue;
     if (key.includes("\0") || value.includes("\0")) {
       throw new Error("ACPX environment contains a null byte");
     }

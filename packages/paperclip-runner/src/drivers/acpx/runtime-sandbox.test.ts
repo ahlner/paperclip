@@ -34,6 +34,34 @@ afterEach(async () => {
 });
 
 describe("ACPX runtime sandbox", () => {
+  it.each(["approve-reads", "approve-paperclip"] as const)(
+    "keeps canonical Codex network policy in fresh and recovered %s child environments",
+    async (permissionMode) => {
+      const fixture = await sandboxFixture("codex");
+      const binding = { ...fixture.binding, permissionMode };
+      const fresh = await prepareAcpxRuntimeSandbox({ binding, agent: "codex", environment: {
+        PAPERCLIP_CODEX_ACP_NETWORK_ACCESS: "true",
+        PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: "secret",
+      } });
+      const denied = await prepareAcpxRuntimeSandbox({ binding, agent: "codex", environment: {
+        PAPERCLIP_CODEX_ACP_NETWORK_ACCESS: "true",
+        PAPERCLIP_RUNNER_NETWORK_ACCESS: "disabled",
+      } });
+      const cleared = await prepareAcpxRuntimeSandbox({ binding, agent: "codex", environment: {} });
+      expect(fresh.launchEnvironment.PAPERCLIP_CODEX_ACP_NETWORK_ACCESS).toBe("true");
+      expect(fresh.launchEnvironment.PAPERCLIP_RUNNER_NETWORK_ACCESS).toBeUndefined();
+      expect(denied.launchEnvironment.PAPERCLIP_CODEX_ACP_NETWORK_ACCESS).toBe("true");
+      expect(denied.launchEnvironment.PAPERCLIP_RUNNER_NETWORK_ACCESS).toBe("disabled");
+      expect(cleared.launchEnvironment.PAPERCLIP_CODEX_ACP_NETWORK_ACCESS).toBeUndefined();
+      expect(cleared.launchEnvironment.PAPERCLIP_RUNNER_NETWORK_ACCESS).toBeUndefined();
+      for (const sandbox of [fresh, denied, cleared]) {
+        expect(sandbox.launchEnvironment.PAPERCLIP_RUNNER_BOOTSTRAP_TICKET).toBeUndefined();
+        expect(sandbox.persistedEnvironment.PAPERCLIP_CODEX_ACP_NETWORK_ACCESS).toBeUndefined();
+        expect(sandbox.persistedEnvironment.PAPERCLIP_RUNNER_NETWORK_ACCESS).toBeUndefined();
+      }
+    },
+  );
+
   it("restores Grok permission controls on recovery without importing compatible hooks or credentials", async () => {
     const fixture = await sandboxFixture("grok");
     const sandbox = await prepareAcpxRuntimeSandbox({ binding: fixture.binding, agent: "grok" });

@@ -5,6 +5,29 @@ afterEach(() => vi.unstubAllEnvs());
 import { ACPX_CREDENTIAL_BINDING_ENV, createAcpxCredentialBinding, createAcpxSidecarHostEnvironment, createSanitizedAcpxSpawnInput } from "./environment.js";
 
 describe("ACPX launch environment", () => {
+  it.each([
+    ["true", undefined, "true", undefined],
+    ["false", undefined, "false", undefined],
+    ["true", "disabled", "true", "disabled"],
+    [undefined, "disabled", undefined, "disabled"],
+    ["invalid", "enabled", undefined, undefined],
+    ["1", "DISABLED", undefined, undefined],
+    [undefined, undefined, undefined, undefined],
+  ])("projects only canonical Codex ACP network policy (%s, %s)", (override, runnerAccess, expectedOverride, expectedRunnerAccess) => {
+    const source = {
+      PAPERCLIP_CODEX_ACP_NETWORK_ACCESS: override,
+      PAPERCLIP_RUNNER_NETWORK_ACCESS: runnerAccess,
+      PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: "secret",
+    };
+    const sidecar = createSanitizedAcpxSpawnInput(source, "codex").env;
+    expect(sidecar.PAPERCLIP_CODEX_ACP_NETWORK_ACCESS).toBe(expectedOverride);
+    expect(sidecar.PAPERCLIP_RUNNER_NETWORK_ACCESS).toBe(expectedRunnerAccess);
+    expect(sidecar.PAPERCLIP_RUNNER_BOOTSTRAP_TICKET).toBeUndefined();
+    const provider = createSanitizedAcpxSpawnInput({ ...sidecar }, "codex").env;
+    expect(provider).toEqual(sidecar);
+    expect(createSanitizedAcpxSpawnInput(source, "claude").env).toEqual({});
+  });
+
   it("projects only the selected agent's credentials and runtime allowlist", () => {
     const source = {
       PATH: "/bin",
