@@ -16,7 +16,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
+import { bundledCliExternalDependencies, bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
@@ -112,6 +112,7 @@ const publishPkg = {
   files: cliPkg.files,
   engines: { node: ">=24.11.0" },
   dependencies: sortedDeps,
+  bundleDependencies: [...bundledCliExternalDependencies],
 };
 
 if (Object.keys(sortedOptDeps).length > 0) {

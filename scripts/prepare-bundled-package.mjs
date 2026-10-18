@@ -158,6 +158,12 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   const deployedPackagePath = resolve(destinationDir, "package.json");
   const publishManifest = materializePublishManifest(sourcePackage);
   const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
+  if (bundledDependencies.includes("@agentclientprotocol/codex-acp")) {
+    installManifest.overrides = {
+      ...(installManifest.overrides ?? {}),
+      "@agentclientprotocol/codex-acp": { "@openai/codex": "0.160.0" },
+    };
+  }
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 
   execFileSync(

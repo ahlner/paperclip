@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -17,16 +18,20 @@ import { createRequire } from "node:module";
 import { runInNewContext } from "node:vm";
 
 import cliEsbuildConfig from "../cli/esbuild.config.mjs";
-import { bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
+import { bundledCliExternalDependencies, bundledCliNpmDependencies } from "./cli-bundled-npm-dependencies.mjs";
 import {
   createBundledInstallManifest,
   materializePublishManifest,
+  prepareBundledPackage,
   selectBundledDependencyPatches,
 } from "./prepare-bundled-package.mjs";
 
 const rootPackage = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 const adapterUtilsPackage = JSON.parse(
   await readFile(new URL("../packages/adapter-utils/package.json", import.meta.url), "utf8"),
+);
+const codexAdapterPackage = JSON.parse(
+  await readFile(new URL("../packages/adapters/codex-local/package.json", import.meta.url), "utf8"),
 );
 const runnerPackage = JSON.parse(
   await readFile(new URL("../packages/paperclip-runner/package.json", import.meta.url), "utf8"),
@@ -48,6 +53,15 @@ const claudeAcpPatch = await readFile(
   new URL("../patches/@agentclientprotocol__claude-agent-acp@0.73.0.patch", import.meta.url),
   "utf8",
 );
+const sourceRoot = new URL("..", import.meta.url).pathname;
+
+function publishToolFor(cwd) {
+  return execFileSync("bash", ["-c", "source \"$REPO_ROOT/scripts/release-lib.sh\"; package_publish_tool"], {
+    cwd,
+    env: { ...process.env, REPO_ROOT: sourceRoot },
+    encoding: "utf8",
+  });
+}
 
 for (const version of ["0.12.0", "0.13.1"]) {
   test(`ACPX ${version} release patch uses portable generated unified hunks`, async () => {
@@ -122,6 +136,81 @@ test("published packages preserve the patched ACPX runtime", () => {
   assert.ok(serverPackage.bundleDependencies.includes("acpx"));
   assert.equal(bundledCliNpmDependencies.has("acpx"), true);
   assert.equal(cliEsbuildConfig.external.includes("acpx"), false);
+});
+
+test("Codex adapter publishes an exact bundled ACP dependency", () => {
+  assert.equal(codexAdapterPackage.dependencies["@agentclientprotocol/codex-acp"], "1.6.2");
+  assert.ok(codexAdapterPackage.bundleDependencies.includes("@agentclientprotocol/codex-acp"));
+  assert.equal(
+    rootPackage.pnpm.patchedDependencies["@agentclientprotocol/codex-acp@1.6.2"],
+    "patches/@agentclientprotocol__codex-acp@1.6.2.patch",
+  );
+  assert.ok(bundledCliExternalDependencies.has("@agentclientprotocol/codex-acp"));
+  assert.equal(cliEsbuildConfig.external.includes("@agentclientprotocol/codex-acp"), true);
+  assert.match(releaseScript, /prepare-bundled-package\.mjs/);
+});
+
+test("generated CLI publish manifest stages a patched bundled ACP", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "paperclip-cli-manifest-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, "scripts"));
+  mkdirSync(join(root, "cli"));
+  writeFileSync(join(root, "scripts/generate-npm-package-json.mjs"), readFileSync(new URL("./generate-npm-package-json.mjs", import.meta.url)));
+  writeFileSync(join(root, "scripts/cli-bundled-npm-dependencies.mjs"), readFileSync(new URL("./cli-bundled-npm-dependencies.mjs", import.meta.url)));
+  writeFileSync(join(root, "cli/package.json"), readFileSync(new URL("../cli/package.json", import.meta.url)));
+  symlinkSync(new URL("../packages", import.meta.url).pathname, join(root, "packages"), "dir");
+  symlinkSync(new URL("../server", import.meta.url).pathname, join(root, "server"), "dir");
+
+  execFileSync(process.execPath, [join(root, "scripts/generate-npm-package-json.mjs")], { stdio: "pipe" });
+  const manifest = JSON.parse(readFileSync(join(root, "cli/package.json"), "utf8"));
+  assert.equal(manifest.dependencies["@agentclientprotocol/codex-acp"], "1.6.2");
+  assert.ok(manifest.bundleDependencies.includes("@agentclientprotocol/codex-acp"));
+  mkdirSync(join(root, "cli/dist"));
+  writeFileSync(join(root, "cli/dist/index.js"), "export {};\n");
+  const stagedDir = join(root, "staged");
+  prepareBundledPackage(join(root, "cli"), stagedDir);
+  assert.equal(publishToolFor(stagedDir), "npm");
+  const acpDir = join(stagedDir, "node_modules/@agentclientprotocol/codex-acp");
+  const codexPackage = JSON.parse(readFileSync(join(stagedDir, "node_modules/@openai/codex/package.json"), "utf8"));
+  assert.equal(codexPackage.version, "0.160.0");
+  execFileSync("patch", ["-p1", "-R", "--dry-run", "-d", acpDir], {
+    input: readFileSync(new URL("../patches/@agentclientprotocol__codex-acp@1.6.2.patch", import.meta.url)),
+    stdio: "pipe",
+  });
+});
+
+test("staged Codex adapter contains the complete patched ACP and pinned nested Codex", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "paperclip-codex-acp-stage-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sourceDir = join(root, "source");
+  const destinationDir = join(root, "destination");
+  mkdirSync(join(sourceDir, "dist"), { recursive: true });
+  writeFileSync(join(sourceDir, "dist", "index.js"), "export {};\n");
+  writeFileSync(join(sourceDir, "package.json"), JSON.stringify({
+    ...codexAdapterPackage,
+    dependencies: { "@agentclientprotocol/codex-acp": codexAdapterPackage.dependencies["@agentclientprotocol/codex-acp"] },
+    files: ["dist"],
+  }));
+
+  prepareBundledPackage(sourceDir, destinationDir);
+  assert.equal(publishToolFor(destinationDir), "npm");
+  const acpDir = join(destinationDir, "node_modules/@agentclientprotocol/codex-acp");
+  const acpPackage = JSON.parse(readFileSync(join(acpDir, "package.json"), "utf8"));
+  const acpSource = readFileSync(join(acpDir, "dist/index.js"), "utf8");
+  const codexPackage = JSON.parse(readFileSync(join(destinationDir, "node_modules/@openai/codex/package.json"), "utf8"));
+  assert.equal(lstatSync(acpDir).isDirectory(), true);
+  assert.equal(acpPackage.version, "1.6.2");
+  assert.equal(acpPackage.dependencies["@openai/codex"], "0.160.0");
+  assert.equal(codexPackage.version, "0.160.0");
+  execFileSync("patch", ["-p1", "-R", "--dry-run", "-d", acpDir], {
+    input: readFileSync(new URL("../patches/@agentclientprotocol__codex-acp@1.6.2.patch", import.meta.url)),
+    stdio: "pipe",
+  });
+  for (const marker of [
+    "paperclipBaseInstructions", "paperclipSandboxPolicy", "PAPERCLIP_ACPX_ISOLATED_CONTEXT",
+    "include_apps_instructions", "features.memory_tool", "skills.include_instructions",
+    "rawInput: { serverName: params.serverName }", "goalPublishIsCurrent",
+  ]) assert.ok(acpSource.includes(marker), `missing ACP patch behavior: ${marker}`);
 });
 
 test("Paperclip Runner pins the qualified ACPX host callbacks", () => {
