@@ -111,7 +111,9 @@ export function createSanitizedAcpxSpawnInput(
     "PAPERCLIP_NATIVE_MCP_NAME",
     "PAPERCLIP_NATIVE_MCP_URL",
     ...credentialNames,
-    ...(agent === "codex" ? ["PAPERCLIP_CODEX_ACP_NETWORK_ACCESS", "PAPERCLIP_RUNNER_NETWORK_ACCESS"] : []),
+    ...(agent === "codex" && environment !== undefined
+      ? ["PAPERCLIP_CODEX_ACP_NETWORK_ACCESS", "PAPERCLIP_RUNNER_NETWORK_ACCESS"]
+      : []),
   ]);
   let retainedBytes = 0;
   for (const [key, value] of Object.entries(source)) {

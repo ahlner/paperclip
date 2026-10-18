@@ -28,6 +28,20 @@ describe("ACPX launch environment", () => {
     expect(createSanitizedAcpxSpawnInput(source, "claude").env).toEqual({});
   });
 
+  it.each(["true", "false"])("does not admit ambient Codex network policy %s without a task environment", (ambientOverride) => {
+    vi.stubEnv("PAPERCLIP_CODEX_ACP_NETWORK_ACCESS", ambientOverride);
+    vi.stubEnv("PAPERCLIP_RUNNER_NETWORK_ACCESS", "disabled");
+    const inherited = createSanitizedAcpxSpawnInput(undefined, "codex").env;
+    expect(inherited.PAPERCLIP_CODEX_ACP_NETWORK_ACCESS).toBeUndefined();
+    expect(inherited.PAPERCLIP_RUNNER_NETWORK_ACCESS).toBeUndefined();
+    const projected = createSanitizedAcpxSpawnInput({
+      PAPERCLIP_CODEX_ACP_NETWORK_ACCESS: "false",
+      PAPERCLIP_RUNNER_NETWORK_ACCESS: "disabled",
+    }, "codex").env;
+    expect(projected.PAPERCLIP_CODEX_ACP_NETWORK_ACCESS).toBe("false");
+    expect(projected.PAPERCLIP_RUNNER_NETWORK_ACCESS).toBe("disabled");
+  });
+
   it("projects only the selected agent's credentials and runtime allowlist", () => {
     const source = {
       PATH: "/bin",
