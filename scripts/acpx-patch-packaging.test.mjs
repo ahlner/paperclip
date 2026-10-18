@@ -63,6 +63,28 @@ function publishToolFor(cwd) {
   });
 }
 
+function installPackedOnDarwin(stagedDir, root, packageName) {
+  const packed = JSON.parse(execFileSync("npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", root], {
+    cwd: stagedDir,
+    encoding: "utf8",
+  }));
+  const installDir = join(root, "darwin-install");
+  mkdirSync(installDir);
+  execFileSync("npm", [
+    "install", "--prefix", installDir, "--os=darwin", "--cpu=arm64",
+    "--ignore-scripts", "--no-audit", "--no-fund", "--no-save",
+    join(root, packed[0].filename),
+  ], { stdio: "pipe" });
+  const installedPackageDir = join(installDir, "node_modules", packageName);
+  const codexRequire = createRequire(join(installedPackageDir, "node_modules/@openai/codex/bin/codex.js"));
+  const darwinBinaryPackage = codexRequire.resolve("@openai/codex-darwin-arm64/package.json");
+  assert.equal(
+    JSON.parse(readFileSync(darwinBinaryPackage, "utf8")).version,
+    "0.160.0-darwin-arm64",
+  );
+  assert.throws(() => codexRequire.resolve("@openai/codex-linux-x64/package.json"), { code: "MODULE_NOT_FOUND" });
+}
+
 for (const version of ["0.12.0", "0.13.1"]) {
   test(`ACPX ${version} release patch uses portable generated unified hunks`, async () => {
     const patch = await readFile(
@@ -165,6 +187,10 @@ test("generated CLI publish manifest stages a patched bundled ACP", (t) => {
   const manifest = JSON.parse(readFileSync(join(root, "cli/package.json"), "utf8"));
   assert.equal(manifest.dependencies["@agentclientprotocol/codex-acp"], "1.6.2");
   assert.ok(manifest.bundleDependencies.includes("@agentclientprotocol/codex-acp"));
+  writeFileSync(join(root, "cli/package.json"), JSON.stringify({
+    ...manifest,
+    dependencies: { "@agentclientprotocol/codex-acp": "1.6.2" },
+  }));
   mkdirSync(join(root, "cli/dist"));
   writeFileSync(join(root, "cli/dist/index.js"), "export {};\n");
   const stagedDir = join(root, "staged");
@@ -177,6 +203,7 @@ test("generated CLI publish manifest stages a patched bundled ACP", (t) => {
     input: readFileSync(new URL("../patches/@agentclientprotocol__codex-acp@1.6.2.patch", import.meta.url)),
     stdio: "pipe",
   });
+  installPackedOnDarwin(stagedDir, root, "paperclipai");
 });
 
 test("staged Codex adapter contains the complete patched ACP and pinned nested Codex", (t) => {
@@ -211,6 +238,7 @@ test("staged Codex adapter contains the complete patched ACP and pinned nested C
     "include_apps_instructions", "features.memory_tool", "skills.include_instructions",
     "rawInput: { serverName: params.serverName }", "goalPublishIsCurrent",
   ]) assert.ok(acpSource.includes(marker), `missing ACP patch behavior: ${marker}`);
+  installPackedOnDarwin(destinationDir, root, "@paperclipai/adapter-codex-local");
 });
 
 test("Paperclip Runner pins the qualified ACPX host callbacks", () => {

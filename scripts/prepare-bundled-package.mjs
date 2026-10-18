@@ -174,6 +174,25 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   writeFileSync(deployedPackagePath, `${JSON.stringify(publishManifest, null, 2)}\n`);
   applyBundledDependencyPatches(destinationDir, bundledDependencies, sourceRoot);
 
+  if (bundledDependencies.includes("@agentclientprotocol/codex-acp")) {
+    // npm bundles the staging machine's optional binary, so let consumers fetch their own platform binary.
+    const codexPackage = JSON.parse(readFileSync(
+      resolve(destinationDir, "node_modules/@openai/codex/package.json"), "utf8",
+    ));
+    if (codexPackage.version !== "0.160.0") {
+      throw new Error(`staged @openai/codex must be 0.160.0, found ${codexPackage.version}`);
+    }
+    const stagedPackage = JSON.parse(readFileSync(deployedPackagePath, "utf8"));
+    stagedPackage.optionalDependencies = {
+      ...(stagedPackage.optionalDependencies ?? {}),
+      ...(codexPackage.optionalDependencies ?? {}),
+    };
+    writeFileSync(deployedPackagePath, `${JSON.stringify(stagedPackage, null, 2)}\n`);
+    for (const packageName of Object.keys(codexPackage.optionalDependencies ?? {})) {
+      rmSync(resolve(destinationDir, "node_modules", packageName), { recursive: true, force: true });
+    }
+  }
+
   if (bundledDependencies.includes("acpx")) {
     const acpxPackage = JSON.parse(
       readFileSync(resolve(destinationDir, "node_modules/acpx/package.json"), "utf8"),
