@@ -65,6 +65,18 @@ describe("Codex MCP OAuth file store", () => {
     expect(JSON.parse(await fs.readFile(paths.stablePath, "utf8"))[key].access_token).toBe("old");
   });
 
+  it("rejects ambiguous run credentials without changing the stable store", async () => {
+    const paths = await fixture();
+    const baseline = await stageCodexMcpOauthStore({ ...paths, serverName, serverUrl });
+    const stableBefore = await fs.readFile(paths.stablePath, "utf8");
+    await fs.writeFile(path.join(paths.runHome, ".credentials.json"), JSON.stringify({
+      [key]: entry("new"),
+      "duplicate|1234567890abcdef": entry("duplicate"),
+    }));
+    await expect(persistCodexMcpOauthStore({ ...paths, serverName, serverUrl, baseline })).resolves.toBe("invalid");
+    expect(await fs.readFile(paths.stablePath, "utf8")).toBe(stableBefore);
+  });
+
   it("rejects a forged key even when the entry claims the GitLab endpoint", async () => {
     const paths = await fixture();
     await fs.rm(paths.stablePath);

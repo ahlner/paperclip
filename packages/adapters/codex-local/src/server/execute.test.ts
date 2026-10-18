@@ -22,7 +22,7 @@ const {
   prepareAdapterExecutionTargetRuntime,
   startAdapterExecutionTargetPaperclipBridge,
 } = vi.hoisted(() => ({
-  runChildProcess: vi.fn(async () => ({
+  runChildProcess: vi.fn(async (_runId: string, _command: string, _args: string[], _options: { env?: Record<string, string> }) => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
@@ -99,6 +99,10 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
 
   afterEach(async () => {
     vi.clearAllMocks();
+    runChildProcess.mockImplementation(async () => ({
+      exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "",
+      pid: 321, startedAt: new Date().toISOString(),
+    }));
     if (savedCodexHomeEnv === undefined) {
       delete process.env.CODEX_HOME;
     } else {
@@ -126,6 +130,149 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
       2,
     );
   }
+
+  it("keeps connector-skill MCP OAuth local runs bound to each responsible user's provider home", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-connector-mcp-local-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir);
+    const mcpKey = `gitlab_ingress|${createHash("sha256").update(JSON.stringify({ headers: {}, type: "http", url: "https://gitlab.com/api/v4/mcp" })).digest("hex").slice(0, 16)}`;
+    const mcp = (token: string) => JSON.stringify({ [mcpKey]: {
+      server_name: "gitlab_ingress", server_url: "https://gitlab.com/api/v4/mcp",
+      client_id: "client", access_token: token, scopes: ["mcp"],
+    } });
+    const providerHomes = [path.join(rootDir, "user-a"), path.join(rootDir, "user-b")];
+    for (const [index, home] of providerHomes.entries()) {
+      await mkdir(home);
+      await writeFile(path.join(home, "auth.json"), JSON.stringify({ OPENAI_API_KEY: "fixture" }), { mode: 0o600 });
+      await writeFile(path.join(home, "config.toml"), [
+        'cli_auth_credentials_store = "file"', 'mcp_oauth_credentials_store = "file"',
+        '[mcp_servers.gitlab_ingress]', 'url = "https://gitlab.com/api/v4/mcp"',
+        'auth = "oauth"', 'scopes = ["mcp"]',
+      ].join("\n"), { mode: 0o600 });
+      await writeFile(path.join(home, ".credentials.json"), mcp(`user-${index}`), { mode: 0o600 });
+    }
+    savedCodexHomeEnv = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = path.join(rootDir, "shared");
+    const seenHomes: string[] = [];
+    const seenTokens: string[] = [];
+    let simulateLogin = false;
+    runChildProcess.mockImplementation(async (_runId: string, _command: string, _args: string[], options: { env?: Record<string, string> }) => {
+      const home = options.env?.CODEX_HOME ?? "";
+      seenHomes.push(home);
+      const contents = await readFile(path.join(home, ".credentials.json"), "utf8").catch(() => null);
+      const token = contents ? JSON.parse(contents)[mcpKey].access_token as string : "missing";
+      seenTokens.push(token);
+      if (contents) await writeFile(path.join(home, ".credentials.json"), mcp(`${token}-refreshed`), { mode: 0o600 });
+      else if (simulateLogin) await writeFile(path.join(home, ".credentials.json"), mcp("new-login"), { mode: 0o600 });
+      return { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: 321, startedAt: new Date().toISOString() };
+    });
+    for (const [index, home] of providerHomes.entries()) {
+      await execute({
+        runId: `connector-user-${index}`, agent: { id: "agent-1", companyId: "company-1", name: "CodexCoder", adapterType: "codex_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: "codex", engine: "cli", env: { CODEX_HOME: home }, paperclipConnectorSkillDigest: "a".repeat(64), managedAiConnection: { provider: "openai", method: "subscription", identity: `user-${index}` } },
+        context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+        onLog: async () => {},
+      });
+    }
+    expect(seenTokens).toEqual(["user-0", "user-1"]);
+    expect(seenHomes[0]).not.toBe(seenHomes[1]);
+    for (const [index, home] of providerHomes.entries()) {
+      const store = JSON.parse(await readFile(path.join(home, ".credentials.json"), "utf8"));
+      expect(store[mcpKey].access_token).toBe(`user-${index}-refreshed`);
+    }
+    await rm(path.join(providerHomes[0]!, ".credentials.json"));
+    await execute({
+      runId: "connector-user-0-revoked", agent: { id: "agent-1", companyId: "company-1", name: "CodexCoder", adapterType: "codex_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "codex", engine: "cli", env: { CODEX_HOME: providerHomes[0] }, paperclipConnectorSkillDigest: "a".repeat(64), managedAiConnection: { provider: "openai", method: "subscription", identity: "user-0" } },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      onLog: async () => {},
+    });
+    expect(seenTokens.at(-1)).toBe("missing");
+    simulateLogin = true;
+    await execute({
+      runId: "connector-user-0-login", agent: { id: "agent-1", companyId: "company-1", name: "CodexCoder", adapterType: "codex_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "codex", engine: "cli", env: { CODEX_HOME: providerHomes[0] }, paperclipConnectorSkillDigest: "a".repeat(64), managedAiConnection: { provider: "openai", method: "subscription", identity: "user-0" } },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      onLog: async () => {},
+    });
+    const loggedIn = JSON.parse(await readFile(path.join(providerHomes[0]!, ".credentials.json"), "utf8"));
+    expect(loggedIn[mcpKey].access_token).toBe("new-login");
+  });
+
+  it("stages and restores connector-skill MCP OAuth remotely through each responsible user's provider home", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-connector-mcp-remote-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir);
+    const mcpKey = `gitlab_ingress|${createHash("sha256").update(JSON.stringify({ headers: {}, type: "http", url: "https://gitlab.com/api/v4/mcp" })).digest("hex").slice(0, 16)}`;
+    const mcp = (token: string) => JSON.stringify({ [mcpKey]: {
+      server_name: "gitlab_ingress", server_url: "https://gitlab.com/api/v4/mcp",
+      client_id: "client", access_token: token, scopes: ["mcp"],
+    } });
+    const seenTokens: string[] = [];
+    const homes = [path.join(rootDir, "user-a"), path.join(rootDir, "user-b")];
+    savedCodexHomeEnv = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = path.join(rootDir, "shared");
+    for (const [index, home] of homes.entries()) {
+      await mkdir(home);
+      await writeFile(path.join(home, "auth.json"), JSON.stringify({ OPENAI_API_KEY: "fixture" }), { mode: 0o600 });
+      await writeFile(path.join(home, "config.toml"), [
+        'cli_auth_credentials_store = "file"', 'mcp_oauth_credentials_store = "file"',
+        '[mcp_servers.gitlab_ingress]', 'url = "https://gitlab.com/api/v4/mcp"',
+        'auth = "oauth"', 'scopes = ["mcp"]',
+      ].join("\n"), { mode: 0o600 });
+      await writeFile(path.join(home, ".credentials.json"), mcp(`user-${index}`), { mode: 0o600 });
+      prepareAdapterExecutionTargetRuntime.mockImplementationOnce(async (input: { assets?: SandboxManagedRuntimeAsset[] }) => {
+        const assets = input.assets ?? [];
+        const stagedHome = assets.find((asset) => asset.key === "home")?.localDir;
+        const staged = stagedHome ? await readFile(path.join(stagedHome, ".credentials.json"), "utf8").catch(() => null) : null;
+        seenTokens.push(staged ? JSON.parse(staged)[mcpKey].access_token : "missing");
+        return {
+          target: { kind: "remote", transport: "ssh" }, workspaceRemoteDir: "/remote/workspace",
+          runtimeRootDir: REMOTE_RUNTIME_ROOT, assetDirs: { home: `${REMOTE_RUNTIME_ROOT}/home` },
+          restoreWorkspace: async () => {
+            for (const asset of assets) await asset.restore?.({
+              assetDir: `${REMOTE_RUNTIME_ROOT}/home`,
+              readFile: async (file) => file.endsWith("/.credentials.json") ? Buffer.from(mcp(`user-${index}-refreshed`)) : Buffer.from("{}"),
+            });
+          },
+        };
+      });
+      await execute({
+        runId: `connector-remote-user-${index}`, agent: { id: "agent-1", companyId: "company-1", name: "CodexCoder", adapterType: "codex_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: "codex", engine: "cli", env: { CODEX_HOME: home }, paperclipConnectorSkillDigest: "a".repeat(64), managedAiConnection: { provider: "openai", method: "subscription", identity: `user-${index}` } },
+        context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+        executionTransport: { remoteExecution: { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace", privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true } },
+        onLog: async () => {},
+      });
+    }
+    expect(seenTokens).toEqual(["user-0", "user-1"]);
+    for (const [index, home] of homes.entries()) {
+      const store = JSON.parse(await readFile(path.join(home, ".credentials.json"), "utf8"));
+      expect(store[mcpKey].access_token).toBe(`user-${index}-refreshed`);
+    }
+  });
+
+  it("rejects managed connector runs without a responsible user's provider home", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-connector-mcp-missing-home-"));
+    cleanupDirs.push(rootDir);
+    savedCodexHomeEnv = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = path.join(rootDir, "shared");
+    await mkdir(process.env.CODEX_HOME);
+    await writeFile(path.join(process.env.CODEX_HOME, "auth.json"), JSON.stringify({ OPENAI_API_KEY: "fixture" }), { mode: 0o600 });
+    await expect(execute({
+      runId: "connector-missing-provider-home", agent: { id: "agent-1", companyId: "company-1", name: "CodexCoder", adapterType: "codex_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: "codex", engine: "cli", env: {}, paperclipConnectorSkillDigest: "a".repeat(64), managedAiConnection: { provider: "openai", method: "subscription", identity: "user-0" } },
+      context: { paperclipWorkspace: { cwd: rootDir, source: "project_primary" } },
+      onLog: async () => {},
+    })).rejects.toThrow("provider home");
+  });
 
   async function runTeardown(input: { sandboxAuth: string; hostAuth: string; hostMcp?: string; sandboxMcp?: string; managedGitlab?: boolean; includeGitlabConfig?: boolean; authReadError?: boolean; allowExecutionError?: boolean; onProviderStopped?: () => Promise<void> }) {
     const rootDir = await mkdtemp(

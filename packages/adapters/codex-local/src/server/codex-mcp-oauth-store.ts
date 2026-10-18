@@ -173,9 +173,14 @@ export async function persistCodexMcpOauthStore(
   await ensurePrivateParent(input.stablePath);
   await ensurePrivateParent(path.join(input.runHome, ".credentials.json"));
   let run: Store | null;
-  try { run = await readStore(path.join(input.runHome, ".credentials.json")); }
-  catch (error) { if (error instanceof SyntaxError || (error as Error).message.startsWith("Invalid Codex MCP OAuth store")) return "invalid"; throw error; }
-  const selected = matching(run, input.serverName, input.serverUrl);
+  let selected: [string, Entry] | null;
+  try {
+    run = await readStore(path.join(input.runHome, ".credentials.json"));
+    selected = matching(run, input.serverName, input.serverUrl);
+  } catch (error) {
+    if (error instanceof SyntaxError || (error as Error).message.startsWith("Invalid Codex MCP OAuth store") || (error as Error).message === "Ambiguous Codex MCP OAuth credential") return "invalid";
+    throw error;
+  }
   if (!selected) return run ? "invalid" : "unchanged";
   const [key, value] = selected;
   if (key !== codexStoreKey(input.serverName, input.serverUrl) || !validEntry(value, input.serverName, input.serverUrl)) return "invalid";

@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { inferOpenAiCompatibleBiller, type AdapterExecutionContext, type AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { buildCodexAuthInboundProvision } from "./codex-auth-merge-scripts.js";
 import { copyBackCodexAuth } from "./codex-auth-copyback.js";
-import { persistCodexMcpOauthStore, stageCodexMcpOauthStore } from "./codex-mcp-oauth-store.js";
+import { persistCodexMcpOauthStore, stageCodexMcpOauthStore, type CodexMcpOauthBaseline } from "./codex-mcp-oauth-store.js";
 import {
   ensureCodexAuthCacheEntryDir,
   isCodexAuthCacheEnabled,
@@ -667,11 +667,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const connectorSourceHome = configuredCodexHome;
   const connectorSkillDigest = typeof config.paperclipConnectorSkillDigest === "string"
     && /^[a-f0-9]{64}$/.test(config.paperclipConnectorSkillDigest) ? config.paperclipConnectorSkillDigest : null;
+  if (connectorSkillDigest && config.managedAiConnection && !connectorSourceHome) {
+    throw new Error("Managed connector run requires a responsible user's provider home");
+  }
   if (connectorSkillDigest) {
     // Never mount assignment-specific skills into the shared company/user home.
     // A different skill revision gets a new home, so revoked/changed resources
     // cannot survive as stale symlinks or bleed into another agent's session.
-    configuredCodexHome = path.join(resolveManagedCodexHomeDir(process.env, agent.companyId),
+    configuredCodexHome = path.join(config.managedAiConnection && connectorSourceHome
+      ? connectorSourceHome : resolveManagedCodexHomeDir(process.env, agent.companyId),
       "connector-runtimes", agent.id, connectorSkillDigest);
   }
   const codexSkillEntries = (await readPaperclipRuntimeSkillEntries(config, __moduleDir))
@@ -724,7 +728,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       apiKey: configuredOpenAiApiKey,
     });
   }
-  if (configuredHomeIsManaged && configuredCodexHome) {
+  if ((configuredHomeIsManaged || (connectorSkillDigest && connectorSourceHome)) && configuredCodexHome) {
     const seedEnv = connectorSkillDigest ? {
       ...process.env, CODEX_HOME: connectorSourceHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
     } : process.env;
@@ -734,6 +738,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
   const effectiveCodexHome = configuredCodexHome ?? defaultCodexHome;
+  const mcpStoreHome = connectorSkillDigest && config.managedAiConnection && connectorSourceHome
+    ? connectorSourceHome : effectiveCodexHome;
   await fs.mkdir(effectiveCodexHome, { recursive: true });
 
   // Never launch a managed CODEX_HOME with no credentials. Without auth.json
@@ -773,6 +779,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // here so the outer `finally` can remove it on every exit path (teardown and
   // error), never only the happy path.
   let stagedCodexHomeDir: string | null = null;
+  let localMcpBaseline: CodexMcpOauthBaseline = null;
+  let localMcpStaged = false;
+  const mcpServerName = "gitlab_ingress";
+  const mcpServerUrl = "https://gitlab.com/api/v4/mcp";
   try {
     for (const note of preparedRuntimeConfig.notes) {
       await onLog("stdout", `[paperclip] ${note}\n`);
@@ -812,6 +822,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         desiredSkillNames,
       },
     );
+    const managedGitlabMcp = Boolean(config.managedAiConnection) && await hasManagedGitlabMcpOauthConfig(effectiveCodexHome);
+    if (connectorSkillDigest && !executionTargetIsRemote && managedGitlabMcp && mcpStoreHome !== effectiveCodexHome) {
+      // Reused connector homes cannot retain a credential after the provider
+      // home loses access. Stage only the current provider home's entry.
+      await fs.rm(path.join(effectiveCodexHome, ".credentials.json"), { force: true });
+      localMcpBaseline = await stageCodexMcpOauthStore({
+        stablePath: path.join(mcpStoreHome, ".credentials.json"),
+        runHome: effectiveCodexHome,
+        serverName: mcpServerName,
+        serverUrl: mcpServerUrl,
+      });
+      localMcpStaged = true;
+    }
     const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
       executionTarget,
       asNumber(config.timeoutSec, 0),
@@ -838,11 +861,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // Codex's MCP OAuth file is separate from auth.json. Carry only the
           // approved GitLab endpoint into the sandbox, recording the staged
           // version so a parallel run cannot overwrite a changed host token.
-          const mcpServerName = "gitlab_ingress";
-          const mcpServerUrl = "https://gitlab.com/api/v4/mcp";
-          const managedGitlabMcp = Boolean(config.managedAiConnection) && await hasManagedGitlabMcpOauthConfig(effectiveCodexHome);
           const mcpBaseline = managedGitlabMcp ? await stageCodexMcpOauthStore({
-            stablePath: path.join(effectiveCodexHome, ".credentials.json"),
+            stablePath: path.join(mcpStoreHome, ".credentials.json"),
             runHome: stagedCodexHomeDir,
             serverName: mcpServerName,
             serverUrl: mcpServerUrl,
@@ -917,7 +937,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                         // at teardown even when validation fails.
                         await fs.writeFile(path.join(stagedCodexHomeDir!, ".credentials.json"), sandboxMcpBytes, { mode: 0o600 });
                         const outcome = await persistCodexMcpOauthStore({
-                          stablePath: path.join(effectiveCodexHome, ".credentials.json"),
+                          stablePath: path.join(mcpStoreHome, ".credentials.json"),
                           runHome: stagedCodexHomeDir!,
                           serverName: mcpServerName,
                           serverUrl: mcpServerUrl,
@@ -1706,5 +1726,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // prepareCodexRuntimeConfig restores the original from the pre-run backup
     // written at prepare time.
     await preparedRuntimeConfig.cleanup();
+    if (localMcpStaged) {
+      const outcome = await persistCodexMcpOauthStore({
+        stablePath: path.join(mcpStoreHome, ".credentials.json"),
+        runHome: effectiveCodexHome,
+        serverName: mcpServerName,
+        serverUrl: mcpServerUrl,
+        baseline: localMcpBaseline,
+      });
+      if (outcome === "conflict" || outcome === "invalid") {
+        await onLog("stderr", `[paperclip] Codex MCP OAuth copy-back: ${outcome}; host credential kept.\n`);
+      }
+    }
   }
 }
