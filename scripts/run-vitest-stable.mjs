@@ -497,6 +497,9 @@ function runSerializedSuites(routeTests, shardIndex, shardCount) {
         routeTest.repoPath,
         "--pool=forks",
         "--isolate",
+        // Each route suite starts a fresh module graph; cold imports can exceed
+        // the server project's 15 s default on loaded runners.
+        "--testTimeout=30000",
       ],
       routeTest.repoPath,
     );

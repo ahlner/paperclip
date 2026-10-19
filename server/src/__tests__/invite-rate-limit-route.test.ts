@@ -91,7 +91,7 @@ describe("invite-token endpoint rate limiting", () => {
         details: { retryAfterSeconds: 60 },
       });
     },
-    20_000,
+    30_000,
   );
 
   it(
