@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -327,6 +327,22 @@ function selectSerializedSuites(routeTests, shardIndex, shardCount) {
   return shardFiles.map((file) => byRepoPath.get(file));
 }
 
+function removeTestRoot(root) {
+  try {
+    rmSync(root, { recursive: true, force: true });
+  } catch (error) {
+    if (error.code !== "EACCES" && error.code !== "EPERM") throw error;
+    const makeDirectoriesWritable = (directory) => {
+      chmodSync(directory, statSync(directory).mode | 0o700);
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        if (entry.isDirectory()) makeDirectoriesWritable(path.join(directory, entry.name));
+      }
+    };
+    makeDirectoriesWritable(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function runVitest(args, label, testShard = null) {
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
@@ -347,30 +363,35 @@ function runVitest(args, label, testShard = null) {
   };
   mkdirSync(env.PAPERCLIP_HOME, { recursive: true });
   mkdirSync(env.TMPDIR, { recursive: true });
-  if (testShard) {
-    const collect = (filters, name) => {
-      const output = path.join(testRoot, `${name}.json`);
-      const result = spawnSync("pnpm", ["exec", "vitest", "list", ...sourceOnlyVitestArgs,
-        ...filters, "--allowOnly=false", "--includeTaskLocation", `--json=${output}`], {
-        cwd: repoRoot, env, stdio: "inherit",
-      });
-      if (result.error || result.status !== 0) fail(`Vitest collection failed: ${result.error?.message ?? result.status}`);
-      return JSON.parse(readFileSync(output, "utf8"));
-    };
-    const collected = collect(args, "all");
-    const file = path.resolve(repoRoot, chatSuite);
-    const selected = partitionTestLines(collected, testShard.count, file)[testShard.index];
-    const filters = selected.lines.map((line) => `${chatSuite}:${line}`);
-    args = [...args.filter((arg) => arg !== chatSuite), ...filters];
-    assertSelectedTests(selected.tests, collect(args, "selected"), file);
-    console.log(`[test:run] chat shard ${testShard.index + 1}/${testShard.count}: ${selected.tests.length}/${collected.length} tests, ${selected.lines.length} source lines; exact filter coverage verified`);
-    args.push("--allowOnly=false");
+  let result;
+  try {
+    if (testShard) {
+      const collect = (filters, name) => {
+        const output = path.join(testRoot, `${name}.json`);
+        const result = spawnSync("pnpm", ["exec", "vitest", "list", ...sourceOnlyVitestArgs,
+          ...filters, "--allowOnly=false", "--includeTaskLocation", `--json=${output}`], {
+          cwd: repoRoot, env, stdio: "inherit",
+        });
+        if (result.error || result.status !== 0) throw new Error(`Vitest collection failed: ${result.error?.message ?? result.status}`);
+        return JSON.parse(readFileSync(output, "utf8"));
+      };
+      const collected = collect(args, "all");
+      const file = path.resolve(repoRoot, chatSuite);
+      const selected = partitionTestLines(collected, testShard.count, file)[testShard.index];
+      const filters = selected.lines.map((line) => `${chatSuite}:${line}`);
+      args = [...args.filter((arg) => arg !== chatSuite), ...filters];
+      assertSelectedTests(selected.tests, collect(args, "selected"), file);
+      console.log(`[test:run] chat shard ${testShard.index + 1}/${testShard.count}: ${selected.tests.length}/${collected.length} tests, ${selected.lines.length} source lines; exact filter coverage verified`);
+      args.push("--allowOnly=false");
+    }
+    result = spawnSync("pnpm", ["exec", "vitest", "run", ...sourceOnlyVitestArgs, ...args], {
+      cwd: repoRoot,
+      env,
+      stdio: "inherit",
+    });
+  } finally {
+    removeTestRoot(testRoot);
   }
-  const result = spawnSync("pnpm", ["exec", "vitest", "run", ...sourceOnlyVitestArgs, ...args], {
-    cwd: repoRoot,
-    env,
-    stdio: "inherit",
-  });
   if (result.error) {
     console.error(`[test:run] Failed to start Vitest: ${result.error.message}`);
     process.exit(1);
