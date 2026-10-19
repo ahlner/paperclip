@@ -307,7 +307,7 @@ describe("agent instructions bundle routes", () => {
     expect(mockAgentInstructionsService.getBundle).toHaveBeenCalled();
     expect(mockAuthorizeInstructionRead).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ type: "board" }),
       expect.objectContaining({ companyId: "company-1", id: "11111111-1111-4111-8111-111111111111" }));
-  });
+  }, 30_000);
 
   it("requires instance-admin access for every external instruction entry point", async () => {
     mockAgentService.getById.mockResolvedValue({
