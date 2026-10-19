@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -51,6 +52,40 @@ function dryRunJson(args, envOverrides = {}) {
 
 const SHARD_COUNT = 12;
 const SERIALIZED_SHARD_COUNT = 9;
+
+test("the runner removes its own temp root after successful and failed Vitest calls", () => {
+  const fixtureRoot = mkdtempSync(path.join(os.tmpdir(), "run-vitest-cleanup-test-"));
+  const fakePnpm = path.join(fixtureRoot, "pnpm");
+  const capture = path.join(fixtureRoot, "captured-tmpdir");
+  writeFileSync(fakePnpm, '#!/bin/sh\nprintf "%s\\n" "$TMPDIR" > "$SOF129_CAPTURE_PATH"\nmkdir "$TMPDIR/protected"\nprintf data > "$TMPDIR/protected/file"\nchmod 555 "$TMPDIR/protected"\nexit "$SOF129_FAKE_EXIT"\n');
+  chmodSync(fakePnpm, 0o755);
+  try {
+    for (const exitCode of [0, 7]) {
+      const result = spawnSync(process.execPath, [script, "--mode", "general", "--group", "general-server-native-runner"], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: workflowEnv({
+          PATH: `${fixtureRoot}${path.delimiter}${process.env.PATH}`,
+          SOF129_CAPTURE_PATH: capture,
+          SOF129_FAKE_EXIT: String(exitCode),
+        }),
+      });
+      const generatedTmpdir = readFileSync(capture, "utf8").trim();
+      const generatedRoot = path.dirname(generatedTmpdir);
+      try {
+        assert.equal(result.status, exitCode === 0 ? 0 : 7, result.stderr);
+        assert.equal(existsSync(generatedRoot), false, `runner left ${generatedRoot} after exit ${exitCode}`);
+      } finally {
+        if (existsSync(path.join(generatedTmpdir, "protected"))) {
+          chmodSync(path.join(generatedTmpdir, "protected"), 0o755);
+        }
+        rmSync(generatedRoot, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+});
 
 
 test("the serialized shards form a complete, non-overlapping partition", () => {

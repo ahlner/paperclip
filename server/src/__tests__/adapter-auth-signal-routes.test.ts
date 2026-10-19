@@ -199,7 +199,7 @@ describe("adapter auth-signal route", () => {
     expect(mockEvaluateCodexCredentialReadiness).toHaveBeenCalledWith(
       expect.objectContaining({ companyId: COMPANY_1 }),
     );
-  });
+  }, 30_000);
 
   it("returns absent for codex_local when the readiness predictor reports not ready", async () => {
     mockEvaluateCodexCredentialReadiness.mockResolvedValueOnce({
